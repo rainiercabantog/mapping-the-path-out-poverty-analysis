@@ -1,0 +1,754 @@
+---
+title: "Poverty Index Construction and 4Ps Program Efficiency: A Multi-Method Analysis"
+subtitle: "MCA Index Construction | Logistic Classification | NB Program Analysis | Budget Allocation"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+---
+
+# Setup
+
+## Required Packages
+
+```{r libraries}
+# --- Data I/O & Manipulation ---
+library(readr)
+library(readxl)
+library(writexl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(data.table)
+library(purrr)
+library(tibble)
+
+# --- Statistical Modelling ---
+library(psych)
+library(MASS)
+library(car)
+library(caret)
+library(pROC)
+library(ResourceSelection)
+library(DescTools)
+library(AER)
+library(glmmTMB)
+library(performance)
+library(DHARMa)
+
+# --- Dimensionality Reduction ---
+library(FactoMineR)
+library(factoextra)
+
+# --- Missing Data ---
+library(mice)
+
+# --- Visualization ---
+library(ggplot2)
+library(ggthemes)
+library(corrplot)
+library(gridExtra)
+library(DT)
+```
+
+## Data Loading
+
+> **Repository structure**: Place all required datasets under a `data/` folder  
+> at the root of this project before knitting.
+>
+> | File | Description | Source |
+> |------|-------------|--------|
+> | `FIES_expenditure_data.xlsx` | Expenditure & utilities indicators | FIES 2023 |
+> | `FIES_logit_data.xlsx`       | Household socioeconomic variables  | FIES 2023 |
+> | `NHTS_4PS_data.xlsx`         | 4Ps beneficiary & population counts | NHTS-PR 2021 |
+> | `NEP_budget_data.xlsx`       | Agency budget allocation sub-components | NEP 2021 |
+> | `logistic_data.xlsx`         | Pre-processed BLRM modeling dataset | FIES 2023 (derived) |
+
+```{r data-loading}
+# OBJECTIVE 1 & 2 inputs (FIES 2023)
+expenditure_data <- read_excel("data/FIES_expenditure_data.xlsx")
+household_data   <- read_excel("data/FIES_logit_data.xlsx")
+
+# OBJECTIVE 2 pre-processed dataset (household-level, BLRM-ready)
+df <- read_excel("data/logistic_data.xlsx")
+
+# OBJECTIVE 3 inputs (NHTS-PR 2021)
+poor_data <- read_excel("data/NHTS_4PS_data.xlsx")
+
+# OBJECTIVE 4 inputs (NEP 2021)
+budget_data <- read_excel("data/NEP_budget_data.xlsx")
+```
+
+---
+
+# Objective 1: MCA-Based Poverty Index Construction {#obj1}
+
+> **Inputs**: 23 binary utilities/assets variables from FIES 2023  
+> **Method**: Multiple Correspondence Analysis (MCA) with Benzécri correction  
+> **Output**: Continuous [0, 100] poverty index per household
+
+## Binary Variable Preparation
+
+Transform raw expenditure columns into binary "spends/does not spend" indicators.
+The resulting 23 columns reflect ownership of assets and access to services.
+
+```{r mca-binary-prep}
+mca_data <- expenditure_data %>%
+  mutate(
+    across(
+      .cols  = starts_with("exp_"),
+      .fns   = ~ if_else(is.na(.) | . == 0, 0, 1),
+      .names = "spends_on_{str_remove(.col, 'exp_')}"
+    )
+  ) %>%
+  dplyr::select(-starts_with("exp_")) %>%
+  rename(
+    has_a_house   = spends_on_housing,
+    has_a_vehicle = spends_on_vehicle
+  ) %>%
+  mutate(across(everything(), as.factor))
+
+cat("Binary MCA dataset dimensions:", nrow(mca_data), "households x", ncol(mca_data), "variables\n")
+```
+
+## MCA Eigenvalue Analysis & Dimension Selection
+
+Apply the Benzécri retention rule (λ > 1/K) and compute corrected adjusted eigenvalues
+to determine the number of dimensions to retain.
+
+```{r mca-eigenvalues}
+K             <- ncol(mca_data[, 4:26])   # 23 binary indicator variables
+mca_threshold <- 1 / K                    # Benzécri threshold
+
+# Run full MCA (retain all K dimensions for inspection)
+mca_initial <- MCA(mca_data[, 4:26], ncp = K, graph = FALSE)
+
+# Extract raw eigenvalues and variance percentages
+eig_raw  <- mca_initial$eig[, "eigenvalue"]
+pct_raw  <- mca_initial$eig[, "percentage of variance"]
+cum_raw  <- mca_initial$eig[, "cumulative percentage of variance"]
+
+# Benzécri-corrected adjusted eigenvalues
+lambda_adj <- ((K / (K - 1))^2) * ((eig_raw - mca_threshold)^2)
+lambda_adj[eig_raw <= mca_threshold] <- 0
+
+pct_adj <- lambda_adj / sum(lambda_adj) * 100
+cum_adj <- cumsum(pct_adj)
+
+num_retained <- sum(eig_raw > mca_threshold)
+
+eig_table <- tibble(
+  Dimension  = seq_along(eig_raw),
+  Lambda_Raw = round(eig_raw,    5),
+  Pct_Raw    = round(pct_raw,    3),
+  Lambda_Adj = round(lambda_adj, 5),
+  Pct_Adj    = round(pct_adj,    3),
+  Cum_Adj    = round(cum_adj,    3),
+  Status     = if_else(eig_raw > mca_threshold, "Retained", "Dropped")
+)
+
+cat(sprintf(
+  "Benzecri threshold (1/K = 1/%d): %.4f\nDimensions retained: %d\n",
+  K, mca_threshold, num_retained
+))
+print(eig_table)
+```
+
+## Final MCA & Variable Contributions
+
+```{r mca-final}
+mca_final <- MCA(mca_data[, 4:26], ncp = num_retained, graph = FALSE)
+
+# Variable contributions — focus on "Has" (Level = 1) categories on Dimension 1
+var_contrib <- mca_final$var$contrib %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable_Category") %>%
+  mutate(
+    Level    = str_extract(Variable_Category, "_[01]$") %>% str_remove("_"),
+    Variable = str_remove(Variable_Category, "_[01]$")
+  )
+
+var_contrib %>%
+  filter(Level == "1") %>%
+  dplyr::select(Variable, Contribution = `Dim 1`) %>%
+  mutate(
+    `Share (%)` = sprintf("%.2f%%", (Contribution / sum(Contribution)) * 100)
+  ) %>%
+  arrange(desc(Contribution)) %>%
+  print()
+```
+
+## MCA Score Extraction & Sign Alignment
+
+Ensure Dimension 1 is positively oriented: higher score = higher welfare (lower poverty risk).
+
+```{r mca-scores}
+mca_scores_raw <- mca_final$ind$coord
+mca_scores_std <- scale(mca_scores_raw)
+
+# Align sign: Dim 1 should correlate positively with total income
+sign_check <- cor(
+  mca_scores_std[, 1],
+  as.numeric(household_data$TOINC),
+  method = "spearman",
+  use    = "complete.obs"
+)
+cat(sprintf("Spearman r (Dim 1 vs. income): %.4f — sign: %s\n",
+    sign_check, ifelse(sign_check > 0, "positive (no flip needed)", "negative (flipping)")))
+
+mca_scores_aligned       <- mca_scores_std
+mca_scores_aligned[, 1] <- sign(sign_check) * mca_scores_std[, 1]
+```
+
+## Rescaling to [0, 100] & Regional Poverty Thresholding
+
+The continuous MCA score is rescaled to [0, 100]. Within each region, the bottom
+percentile corresponding to the official PSA 2023 poverty incidence rate is classified
+as poor (`mca_binary = 1`).
+
+```{r mca-index-rescale}
+rescale_0_100    <- function(x) ((x - min(x)) / (max(x) - min(x))) * 100
+mca_index_dim1   <- rescale_0_100(mca_scores_aligned[, 1])
+household_data$mca_index <- mca_index_dim1
+
+# Descriptive check by income quintile — index should increase with quintile
+household_data %>%
+  group_by(income_q) %>%
+  summarise(
+    Median_MCA = round(median(mca_index, na.rm = TRUE), 2),
+    Mean_MCA   = round(mean(mca_index,   na.rm = TRUE), 2),
+    N          = n(),
+    .groups    = "drop"
+  ) %>%
+  print()
+```
+
+```{r poverty-thresholding}
+# Official PSA 2023 regional poverty incidence rates
+region_rates <- tibble::tribble(
+  ~W_REGN, ~Region_Name,    ~Poverty_Rate_2023,
+  13, "NCR",          1.1,
+  14, "CAR",          4.4,
+   1, "Region I",     8.4,
+   2, "Region II",    7.2,
+   3, "Region III",   5.7,
+   4, "Region IVA",   5.3,
+  17, "MIMAROPA",    16.3,
+   5, "Region V",    20.3,
+   6, "Region VI",    9.8,
+  18, "NIR",         22.6,
+   7, "Region VII",  12.3,
+   8, "Region VIII", 20.3,
+   9, "Region IX",   24.2,
+  10, "Region X",    18.4,
+  11, "Region XI",   11.3,
+  12, "Region XII",  17.0,
+  16, "Caraga",      14.9,
+  19, "BARMM",       23.5
+)
+
+logistic_data <- household_data %>%
+  mutate(W_REGN = as.numeric(W_REGN)) %>%
+  left_join(region_rates %>% mutate(W_REGN = as.numeric(W_REGN)), by = "W_REGN") %>%
+  group_by(W_REGN) %>%
+  mutate(
+    MCA_threshold = quantile(mca_index,
+                             probs  = first(Poverty_Rate_2023) / 100,
+                             na.rm  = TRUE),
+    mca_binary    = ifelse(mca_index <= MCA_threshold, 1, 0)
+  ) %>%
+  ungroup()
+
+# Verification: computed incidence rates should match official PSA figures
+verification_check <- logistic_data %>%
+  group_by(Region_Name, Poverty_Rate_2023) %>%
+  summarise(
+    Computed_Incidence = round(mean(mca_binary, na.rm = TRUE) * 100, 2),
+    .groups = "drop"
+  )
+print(verification_check)
+```
+
+---
+
+# Objective 2: Binary Logistic Regression Model (BLRM) {#obj2}
+
+> **Inputs**: 13 household-level indicator variables from FIES 2023  
+> **Response**: `poor_MCA` (1 = poor, 0 = not poor; derived from MCA index threshold)  
+> **Method**: GLM logistic regression with Recursive Feature Elimination (RFE) for variable selection
+
+## Data Preparation & Type Coercion
+
+```{r blrm-data-prep}
+numeric_cols <- c(
+  "WAGES", "TOTEX", "Male_Count", "Female_Count",
+  "FSIZE", "TOINC", "URB", "Married_Count",
+  "At_Least_HS_Grad_Count", "OFW_Worker_Count",
+  "Has_Job_Or_Work_Count", "Looking_For_Add_Work_Count"
+)
+
+df[numeric_cols] <- lapply(df[numeric_cols], as.numeric)
+df$poor_MCA      <- as.factor(df$mca_binary)
+
+# Top-coding sparse count variables to prevent complete separation
+df$OFW_Capped  <- ifelse(df$OFW_Worker_Count          >= 2, 2, df$OFW_Worker_Count)
+df$Job_Capped  <- ifelse(df$Has_Job_Or_Work_Count      >= 9, 9, df$Has_Job_Or_Work_Count)
+df$Look_Capped <- ifelse(df$Looking_For_Add_Work_Count >= 5, 5, df$Looking_For_Add_Work_Count)
+
+cat("Response distribution:\n")
+print(table(df$poor_MCA))
+```
+
+## Exploratory Summary Statistics
+
+```{r blrm-eda}
+eda_cols <- c(
+  "WAGES", "TOTEX", "Male_Count", "Female_Count",
+  "FSIZE", "TOINC", "URB", "Married_Count",
+  "At_Least_HS_Grad_Count", "OFW_Capped", "Job_Capped", "Look_Capped"
+)
+
+eda_summary <- df %>%
+  dplyr::select(all_of(eda_cols)) %>%
+  pivot_longer(everything(), names_to = "Predictor", values_to = "Value") %>%
+  group_by(Predictor) %>%
+  summarise(
+    Mean   = round(mean(Value,   na.rm = TRUE), 4),
+    Median = round(median(Value, na.rm = TRUE), 4),
+    SD     = round(sd(Value,     na.rm = TRUE), 4),
+    Min    = round(min(Value,    na.rm = TRUE), 4),
+    Max    = round(max(Value,    na.rm = TRUE), 4),
+    .groups = "drop"
+  )
+
+print(eda_summary)
+```
+
+## Initial Full Model & Multicollinearity Check (VIF)
+
+```{r blrm-initial-model}
+logit_initial <- glm(
+  poor_MCA ~ FSIZE + TOINC + URB + Married_Count +
+    At_Least_HS_Grad_Count + OFW_Capped + Job_Capped + Look_Capped,
+  data   = df,
+  family = binomial(link = "logit")
+)
+
+cat("VIF — Initial Full Model:\n")
+print(round(vif(logit_initial), 4))
+```
+
+## Variable Selection via Recursive Feature Elimination (RFE)
+
+5-fold cross-validated RFE using GLM (logistic) and AUC as the selection criterion.
+
+```{r blrm-rfe, cache=TRUE}
+predictors <- c(
+  "WAGES", "TOTEX", "Male_Count", "Female_Count",
+  "FSIZE", "TOINC", "URB", "Married_Count",
+  "At_Least_HS_Grad_Count", "OFW_Capped", "Job_Capped", "Look_Capped"
+)
+
+df_ml              <- df
+df_ml$poor_MCA_Label <- factor(
+  ifelse(df_ml$poor_MCA == "1", "Poor", "Not_Poor"),
+  levels = c("Not_Poor", "Poor")
+)
+
+glm_control <- rfeControl(
+  functions = caretFuncs,
+  method    = "cv",
+  number    = 5,
+  verbose   = FALSE
+)
+
+set.seed(2026)
+rfe_results <- rfe(
+  x          = df_ml[, predictors],
+  y          = df_ml$poor_MCA_Label,
+  sizes      = seq_len(length(predictors)),
+  rfeControl = glm_control,
+  method     = "glm",
+  family     = "binomial",
+  metric     = "ROC",
+  trControl  = trainControl(summaryFunction = twoClassSummary, classProbs = TRUE)
+)
+
+selected_vars <- predictors(rfe_results)
+cat("Selected predictors after RFE:\n")
+print(selected_vars)
+```
+
+## Final Logistic Regression Model
+
+```{r blrm-final-model}
+final_formula <- as.formula(paste("poor_MCA ~", paste(selected_vars, collapse = " + ")))
+
+final_logit <- glm(final_formula, data = df, family = binomial(link = "logit"))
+summary(final_logit)
+
+cat("\nVIF — Final Model:\n")
+print(round(vif(final_logit), 4))
+```
+
+## Model Diagnostics
+
+```{r blrm-diagnostics, fig.width=7, fig.height=5}
+# McFadden's Pseudo-R²
+cat("McFadden's Pseudo-R²:\n")
+print(PseudoR2(final_logit, which = "McFadden"))
+
+# Standardized residuals
+std_resid     <- rstandard(final_logit)
+outlier_count <- sum(abs(std_resid) > 3)
+cat(sprintf("\nObservations |std. residual| > 3: %d\n", outlier_count))
+
+# ROC Curve & AUC
+predicted_probs <- predict(final_logit, type = "response")
+roc_obj         <- roc(df$poor_MCA, predicted_probs)
+auc_val         <- auc(roc_obj)
+
+cat(sprintf("AUC: %.4f\n", auc_val))
+
+plot(
+  roc_obj,
+  col  = "red",
+  lwd  = 2,
+  main = paste0("ROC Curve — Final Logistic Model (AUC = ", round(auc_val, 3), ")")
+)
+abline(a = 0, b = 1, lty = 2, col = "gray50")
+
+# Confusion Matrix (threshold = 0.50)
+predicted_class <- ifelse(predicted_probs > 0.5, "1", "0")
+conf_matrix     <- confusionMatrix(
+  as.factor(predicted_class), df$poor_MCA, positive = "1"
+)
+print(conf_matrix)
+```
+
+---
+
+# Objective 3: Provincial Negative Binomial Loglinear Model {#obj3}
+
+> **Inputs**: 2023 Poor Index (from Obj 1 & 2), 2021 Poor Index (NHTS-PR 2021),  
+>   2-Year 4Ps Program Penetration, 2021 & 2023 Population (province-level)  
+> **Response**: `Poor_Counts_2023` — weighted provincial poor population  
+> **Method**: Negative Binomial loglinear model with log-population offset
+
+## Aggregate 2023 MCA-Derived Poor Counts by Province
+
+```{r obj3-aggregation}
+mca_aggregated <- logistic_data %>%
+  mutate(
+    weighted_poor_pop = as.numeric(mca_binary) * as.numeric(MEM_RFACT),
+    W_REGN            = as.numeric(W_REGN),
+    W_PROV            = as.numeric(W_PROV)
+  ) %>%
+  group_by(W_REGN, W_PROV) %>%
+  summarise(
+    Poor_Counts_2023 = round(sum(weighted_poor_pop, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+cat("Provincial poor counts aggregated:", nrow(mca_aggregated), "provinces\n")
+```
+
+## Build Provincial Loglinear Dataset
+
+Merge NHTS-PR 2021 data with the MCA-derived 2023 poor counts, then compute
+penetration and poverty rate covariates.
+
+```{r obj3-data-build}
+loglinear_data <- poor_data %>%
+  mutate(
+    W_REGN = as.numeric(W_REGN),
+    W_PROV = as.numeric(W_PROV)
+  ) %>%
+  dplyr::select(-Poor_Counts_2023) %>%
+  inner_join(mca_aggregated, by = c("W_REGN", "W_PROV")) %>%
+  mutate(
+    # Scaled poverty rate in 2021
+    Poverty_Rate_2021    = scale(Poor_Counts_2021 / Population_Counts_2021),
+    # 4Ps penetration rates
+    Penetration_4Ps_2021 = Beneficiary_Counts_2021 / Poor_Counts_2021,
+    Penetration_4Ps_2023 = Beneficiary_Counts_2023 / Poor_Counts_2023,
+    # Scaled 2-year change in penetration
+    Penetration_OverTime = scale(Penetration_4Ps_2023 - Penetration_4Ps_2021)
+  ) %>%
+  group_by(W_REGN, W_PROV)
+
+cat("Provincial dataset dimensions:", nrow(loglinear_data), "x", ncol(loglinear_data), "\n")
+cat("\nColumn sums — key count variables:\n")
+print(colSums(loglinear_data[, 4:9]))
+```
+
+## Baseline Poisson Model
+
+Fit a Poisson model first to test for overdispersion before switching to NB.
+
+```{r obj3-poisson}
+provincial_poisson_model <- glmmTMB(
+  Poor_Counts_2023 ~ Poverty_Rate_2021 + Penetration_OverTime +
+    offset(log(Population_Counts_2023)),
+  data   = loglinear_data,
+  family = poisson(link = "log")
+)
+summary(provincial_poisson_model)
+
+provincial_null_poisson <- glmmTMB(
+  Poor_Counts_2023 ~ 1 + offset(log(Population_Counts_2023)),
+  data   = loglinear_data,
+  family = poisson(link = "log")
+)
+
+pearson_ratio_p <- sum(residuals(provincial_poisson_model, type = "pearson")^2) /
+  (nrow(loglinear_data) - length(fixef(provincial_poisson_model)$cond))
+
+cat(sprintf("Poisson deviance      : %.3f\n", deviance(provincial_poisson_model)))
+cat(sprintf("Null Poisson deviance : %.3f\n", deviance(provincial_null_poisson)))
+cat(sprintf("Pearson χ²/df ratio   : %.3f  (>> 1 → overdispersion)\n", pearson_ratio_p))
+
+check_overdispersion(provincial_poisson_model)
+```
+
+## Negative Binomial Model
+
+```{r obj3-nb}
+provincial_nb_model <- glmmTMB(
+  Poor_Counts_2023 ~ Poverty_Rate_2021 + Penetration_OverTime +
+    offset(log(Population_Counts_2023)),
+  data   = loglinear_data,
+  family = nbinom2(link = "log")
+)
+s_nb <- summary(provincial_nb_model)
+print(s_nb)
+
+provincial_null_nb <- glmmTMB(
+  Poor_Counts_2023 ~ 1 + offset(log(Population_Counts_2023)),
+  data   = loglinear_data,
+  family = nbinom2(link = "log")
+)
+
+# McFadden's Pseudo-R²
+mcfadden_r2 <- 1 - (as.numeric(logLik(provincial_nb_model)) /
+                    as.numeric(logLik(provincial_null_nb)))
+cat(sprintf("\nMcFadden Pseudo-R² (NB): %.4f\n", mcfadden_r2))
+```
+
+## Model Comparison: Poisson vs. Negative Binomial
+
+```{r obj3-model-comparison}
+print(anova(provincial_poisson_model, provincial_nb_model))
+```
+
+## Model Fit & Diagnostic Statistics
+
+```{r obj3-diagnostics}
+cat(strrep("=", 60), "\n")
+cat("  DIAGNOSTIC: MODEL FIT STATISTICS\n")
+cat(strrep("=", 60), "\n")
+
+nb_df      <- nrow(loglinear_data) - length(fixef(provincial_nb_model)$cond)
+nb_dev     <- deviance(provincial_nb_model)
+nb_pearson <- sum(residuals(provincial_nb_model, type = "pearson")^2)
+obs_pred_r <- cor(loglinear_data$Poor_Counts_2023, fitted(provincial_nb_model))
+
+cat(sprintf("AIC                       : %.2f\n",  AIC(provincial_nb_model)))
+cat(sprintf("BIC                       : %.2f\n",  BIC(provincial_nb_model)))
+cat(sprintf("Residual deviance         : %.3f  (df = %d)\n", nb_dev, nb_df))
+cat(sprintf("Deviance ratio (dev/df)   : %.3f  (ideal ≈ 1)\n", nb_dev / nb_df))
+cat(sprintf("Pearson χ²                : %.3f\n",  nb_pearson))
+cat(sprintf("Pearson χ²/df ratio       : %.3f  (ideal ≈ 1)\n", nb_pearson / nb_df))
+cat(sprintf("Obs vs. Predicted r       : %.4f\n",  obs_pred_r))
+cat(sprintf("Theta (dispersion param.) : %.4f\n",  s_nb$sigma))
+
+cat("\n", strrep("=", 60), "\n")
+cat("  DIAGNOSTIC: MULTICOLLINEARITY (VIF)\n")
+cat(strrep("=", 60), "\n")
+
+tryCatch({
+  vif_vals <- car::vif(provincial_nb_model)
+  print(round(vif_vals, 4))
+  if (any(vif_vals > 5)) {
+    cat("WARNING — VIF > 5 for:", names(vif_vals)[vif_vals > 5], "\n")
+  } else {
+    cat("OK — All VIF < 5: no concerning multicollinearity.\n")
+  }
+}, error = function(e) {
+  cat("car::vif() unavailable — computing from model matrix correlation.\n")
+  X       <- model.matrix(provincial_nb_model)
+  X_pred  <- X[, -1, drop = FALSE]
+  vif_man <- diag(solve(cor(X_pred)))
+  print(round(vif_man, 4))
+})
+```
+
+## DHARMa Simulation-Based Residuals
+
+```{r obj3-dharma, fig.width=11, fig.height=4.5}
+sim_output <- simulateResiduals(fittedModel = provincial_nb_model)
+
+dharma_df <- data.frame(
+  fitted    = sim_output$fittedPredictedResponse,
+  residuals = sim_output$scaledResiduals
+)
+
+p_qq <- ggplot(dharma_df, aes(sample = residuals)) +
+  stat_qq(distribution = qunif, size = 2, alpha = 0.6, color = "steelblue") +
+  stat_qq_line(distribution = qunif, color = "red", linewidth = 1) +
+  labs(
+    title = "DHARMa Q-Q Plot (Uniform)",
+    x     = "Expected",
+    y     = "Observed Scaled Residuals"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_scatter <- ggplot(dharma_df, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.6, size = 2, color = "steelblue") +
+  geom_hline(yintercept = c(0.25, 0.5, 0.75),
+             linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Residuals vs. Predicted",
+    x     = "Fitted Values",
+    y     = "Scaled Residuals"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+
+grid.arrange(p_qq, p_scatter, ncol = 2)
+```
+
+---
+
+# Objective 4: Budget Allocation Efficiency — Exploratory NB Models {#obj4}
+
+> **Inputs**: 6 budget allocation sub-components from NEP 2021  
+>   (DepEd, DOH, DOLE, DSWD) joined to regional aggregates  
+> **Response**: `Poor_Counts_2023` at the regional level  
+> **Method**: Agency-specific Negative Binomial loglinear models  
+> ⚠ **Note**: Regional sample is small (N = 17 after BARMM exclusion).
+> Treat results as exploratory.
+
+## Regional Data Aggregation & Budget Feature Engineering
+
+```{r obj4-data-prep}
+reg_loglinear_data <- loglinear_data %>%
+  filter(W_REGN != 19) %>%           # Exclude BARMM (data quality)
+  group_by(W_REGN) %>%
+  summarise(
+    Population_Counts_2021  = round(sum(Population_Counts_2021,  na.rm = TRUE)),
+    Population_Counts_2023  = round(sum(Population_Counts_2023,  na.rm = TRUE)),
+    Poor_Counts_2021        = round(sum(Poor_Counts_2021,        na.rm = TRUE)),
+    Poor_Counts_2023        = round(sum(Poor_Counts_2023,        na.rm = TRUE)),
+    Beneficiary_Counts_2021 = round(sum(Beneficiary_Counts_2021, na.rm = TRUE)),
+    Beneficiary_Counts_2023 = round(sum(Beneficiary_Counts_2023, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(W_REGN = as.numeric(W_REGN)) %>%
+  left_join(
+    budget_data %>% mutate(UACS_REG_ID = as.numeric(UACS_REG_ID)),
+    by = c("W_REGN" = "UACS_REG_ID")
+  ) %>%
+  mutate(
+    # Poverty & penetration covariates (unscaled at regional level)
+    Poverty_Rate_2021    = Poor_Counts_2021 / Population_Counts_2021,
+    Penetration_4Ps_2021 = Beneficiary_Counts_2021 / Poor_Counts_2021,
+    Penetration_4Ps_2023 = Beneficiary_Counts_2023 / Poor_Counts_2023,
+    Penetration_OverTime = Penetration_4Ps_2023 - Penetration_4Ps_2021,
+
+    # DepEd: education-focused transfers
+    Total_DepEd         = Col_2_DepEd_Cash_Allowance + Col_3_DepEd_Learner_Support + Col_4_DepEd_Remaining,
+    log_Total_DepEd     = log(Total_DepEd),
+    DepEd_Share_Cash    = Col_2_DepEd_Cash_Allowance  / Total_DepEd,
+    DepEd_Share_Support = Col_3_DepEd_Learner_Support / Total_DepEd,
+
+    # DOH: health-focused transfers
+    Total_DOH           = Col_5_DOH_Local_Health + Col_6_DOH_Public_Health + Col_7_DOH_Remaining,
+    log_Total_DOH       = log(Total_DOH),
+    DOH_Share_Local     = Col_5_DOH_Local_Health  / Total_DOH,
+    DOH_Share_Public    = Col_6_DOH_Public_Health / Total_DOH,
+
+    # DOLE: labor-focused transfers
+    Total_DOLE            = Col_8_DOLE_Job_Search + Col_9_DOLE_Workers_Org + Col_10_DOLE_Remaining,
+    log_Total_DOLE        = log(Total_DOLE),
+    DOLE_Share_JobSearch  = Col_8_DOLE_Job_Search  / Total_DOLE,
+    DOLE_Share_WorkersOrg = Col_9_DOLE_Workers_Org / Total_DOLE,
+
+    # DSWD: social protection transfers
+    Total_DSWD          = Col_11_DSWD_Pantawid + Col_12_DSWD_NHTS + Col_13_DSWD_Remaining,
+    log_Total_DSWD      = log(Total_DSWD),
+    DSWD_Share_Pantawid = Col_11_DSWD_Pantawid / Total_DSWD,
+    DSWD_Share_NHTS     = Col_12_DSWD_NHTS     / Total_DSWD
+  )
+
+cat("Regional dataset:", nrow(reg_loglinear_data), "regions x", ncol(reg_loglinear_data), "columns\n")
+```
+
+## DepEd Allocative Efficiency Model
+
+```{r obj4-deped}
+DEPED_model <- glmmTMB(
+  Poor_Counts_2023 ~
+    Poverty_Rate_2021 + Penetration_OverTime +
+    log_Total_DepEd + DepEd_Share_Support +
+    offset(log(Population_Counts_2023)),
+  data   = reg_loglinear_data,
+  family = nbinom2(link = "log")
+)
+summary(DEPED_model)
+cat(sprintf("DepEd model deviance: %.3f\n", deviance(DEPED_model)))
+```
+
+## DOLE Allocative Efficiency Model
+
+```{r obj4-dole}
+DOLE_model <- glmmTMB(
+  Poor_Counts_2023 ~
+    Poverty_Rate_2021 + Penetration_OverTime +
+    log_Total_DOLE + DOLE_Share_JobSearch +
+    offset(log(Population_Counts_2023)),
+  data   = reg_loglinear_data,
+  family = nbinom2(link = "log")
+)
+summary(DOLE_model)
+cat(sprintf("DOLE model deviance: %.3f\n", deviance(DOLE_model)))
+```
+
+## DSWD Allocative Efficiency Model
+
+```{r obj4-dswd}
+DSWD_model <- glmmTMB(
+  Poor_Counts_2023 ~
+    Poverty_Rate_2021 + Penetration_OverTime +
+    log_Total_DSWD + DSWD_Share_Pantawid +
+    offset(log(Population_Counts_2023)),
+  data   = reg_loglinear_data,
+  family = nbinom2(link = "log")
+)
+summary(DSWD_model)
+cat(sprintf("DSWD model deviance: %.3f\n", deviance(DSWD_model)))
+```
+
+---
+
+*All datasets used in this analysis are proprietary. Data files are **not** included  
+in this repository. See `data/README.md` for data availability and access instructions.*
